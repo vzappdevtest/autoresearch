@@ -1,388 +1,409 @@
 """
 One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+
+Simulates a randomized marketing-campaign A/B/n test and freezes it to disk so
+that every experiment is scored against the exact same data. This file is the
+fixed harness: the data generating process, the logged experiment, and the
+ground-truth evaluation metric all live here and are NOT modified by the agent.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                  # generate + cache the campaign dataset
+    python prepare.py --force          # regenerate even if cache exists
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data is stored in ~/.cache/autoresearch/.
+
+--------------------------------------------------------------------------------
+The problem
+--------------------------------------------------------------------------------
+A marketing team ran a randomized experiment. Each customer was shown one of
+several campaign variants (chosen uniformly at random), including a "no contact"
+control. We logged, per customer: their features, which variant they got, and
+the outcome (whether they converted and the revenue). Because assignment was
+randomized, this log is an unbiased basis for learning a *targeting policy*.
+
+The recommendation task: given a customer's features, decide which campaign
+variant to send them (or none) so as to maximize expected **net profit**
+(expected revenue from conversion minus the cost of the contact). Campaign
+effects are heterogeneous — a variant that lifts conversion for one segment can
+annoy another into never converting — so the best policy is personalized, and
+beats any single mass campaign.
 """
 
 import os
 import sys
 import time
-import math
 import argparse
-import pickle
-from multiprocessing import Pool
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import numpy as np
+import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+RANDOM_SEED = 42          # fixed DGP seed -> the experiment is identical every run
+N_TRAIN = 60_000          # number of logged customers in the training experiment
+N_VAL = 20_000            # number of held-out customers used to score policies
+FIT_TIME_BUDGET = 120     # seconds; a recommender's fit() must finish within this
+
+# Campaign variants. Index 0 is always the "no contact" control.
+CAMPAIGN_NAMES = [
+    "no_contact",          # 0: control, costs nothing, no lift
+    "email_10pct_off",     # 1
+    "email_free_ship",     # 2
+    "sms_reminder",        # 3
+    "retargeting_ad",      # 4
+    "loyalty_points",      # 5
+]
+N_CAMPAIGNS = len(CAMPAIGN_NAMES)
+
+# Per-contact cost in dollars (control is free). These are known to the business,
+# so the recommender is allowed to use them for cost-aware net-value targeting.
+CAMPAIGN_COSTS = np.array([0.00, 0.08, 0.08, 0.04, 0.55, 0.30], dtype=np.float64)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration / cache paths
 # ---------------------------------------------------------------------------
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+TRAIN_PATH = os.path.join(DATA_DIR, "train_experiment.parquet")
+VAL_USERS_PATH = os.path.join(DATA_DIR, "val_users.parquet")
+VAL_LOG_PATH = os.path.join(DATA_DIR, "val_log.parquet")
+TRUTH_PATH = os.path.join(DATA_DIR, "val_truth.npz")   # loaded ONLY by the evaluator
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+# Human-readable customer features. The first block are numeric, the last two
+# are low-cardinality categoricals that get one-hot expanded in build_features().
+NUMERIC_FEATURES = [
+    "age",              # years
+    "tenure_months",    # how long they've been a customer
+    "recency_days",     # days since last purchase
+    "frequency",        # purchases in last year
+    "monetary",         # avg spend per purchase ($)
+    "email_opens_30d",  # engagement signal
+    "web_visits_30d",   # engagement signal
+    "discount_affinity",# latent propensity to respond to discounts [0,1]
+]
+CATEGORICAL_FEATURES = {
+    "region": ["north", "south", "east", "west"],
+    "device": ["mobile", "desktop", "tablet"],
+}
 
 # ---------------------------------------------------------------------------
-# Data download
+# Data generating process (the ground truth — never seen by the recommender)
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+def _raw_customers(n, rng):
+    """Sample a table of raw, human-readable customer features."""
+    age = np.clip(rng.normal(42, 14, n), 18, 90)
+    tenure = np.clip(rng.exponential(28, n), 0, 240)
+    recency = np.clip(rng.exponential(40, n), 0, 365)
+    frequency = rng.poisson(4, n).astype(np.float64)
+    monetary = np.clip(rng.lognormal(3.6, 0.6, n), 5, 500)
+    email_opens = rng.poisson(3, n).astype(np.float64)
+    web_visits = rng.poisson(5, n).astype(np.float64)
+    discount_affinity = rng.beta(2, 3, n)
+    region = rng.choice(CATEGORICAL_FEATURES["region"], n)
+    device = rng.choice(CATEGORICAL_FEATURES["device"], n)
+    return pd.DataFrame({
+        "age": age,
+        "tenure_months": tenure,
+        "recency_days": recency,
+        "frequency": frequency,
+        "monetary": monetary,
+        "email_opens_30d": email_opens,
+        "web_visits_30d": web_visits,
+        "discount_affinity": discount_affinity,
+        "region": region,
+        "device": device,
+    })
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def build_features(df):
+    """
+    Turn the raw customer table into a numeric feature matrix for models.
+
+    This is the sanctioned featurization: the recommender is free to build its
+    own features from the raw columns, but this gives a clean default. Numeric
+    columns pass through; categoricals are one-hot encoded with a fixed column
+    order so the matrix layout is stable across train/val.
+
+    Returns (X, feature_names).
+    """
+    parts = [df[NUMERIC_FEATURES].to_numpy(dtype=np.float64)]
+    names = list(NUMERIC_FEATURES)
+    for col, levels in CATEGORICAL_FEATURES.items():
+        for lvl in levels:
+            parts.append((df[col].to_numpy() == lvl).astype(np.float64)[:, None])
+            names.append(f"{col}={lvl}")
+    return np.concatenate(parts, axis=1), names
+
+
+def _sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def _standardize(X):
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0) + 1e-8
+    return (X - mu) / sd
+
+
+def _true_outcome_model(df, rng):
+    """
+    Compute the ground-truth expected net value V_k(x) for every customer x and
+    every campaign k. This is the oracle used only for scoring — it is never
+    exposed to the recommender.
+
+    Returns:
+        V         : (n, K) expected net profit ($) of each campaign per customer
+        p         : (n, K) true conversion probability of each campaign per customer
+        margin    : (n,)   profit per conversion ($) for each customer
+    """
+    X, _ = build_features(df)
+    Xs = _standardize(X)
+    n, d = Xs.shape
+
+    # The true response surface is deliberately NONLINEAR: campaign effects
+    # depend on feature interactions and thresholds, not just a weighted sum.
+    # A linear model can only capture part of it, so there is real headroom for
+    # better recommenders (interaction features, tree ensembles, X-learners, ...).
+    # This nonlinear basis is used ONLY by the ground truth and is never exposed.
+    def nonlinear_basis(seed):
+        r = np.random.default_rng(seed)
+        cols = [Xs]
+        cols.append(Xs ** 2)                                  # curvature
+        # A handful of random pairwise interactions.
+        for _ in range(8):
+            i, j = r.integers(0, d), r.integers(0, d)
+            cols.append((Xs[:, i] * Xs[:, j])[:, None])
+        # Threshold / regime features (segments respond in step changes).
+        cols.append((Xs > 0.7).astype(np.float64))
+        return np.concatenate(cols, axis=1)
+
+    Z = nonlinear_basis(RANDOM_SEED + 7)
+    dz = Z.shape[1]
+
+    def unit(v):
+        """Zero-mean, unit-std — lets us control effect magnitude independent of the basis."""
+        return (v - v.mean()) / (v.std() + 1e-8)
+
+    # Baseline conversion propensity (campaign 0 / no-contact), ~5-25%.
+    wb = rng.normal(0, 1.0, dz)
+    base_logit = -2.0 + 0.8 * unit(Z @ wb)
+    p0 = _sigmoid(base_logit)
+
+    # Profit per conversion scales with a customer's monetary value.
+    monetary = df["monetary"].to_numpy()
+    margin = 12.0 + 0.35 * monetary   # ~$14-$190 per conversion
+
+    # Heterogeneous, campaign-specific uplift on the conversion probability.
+    # Each campaign responds to a different nonlinear mix of features (its shape
+    # is hard for a linear model to capture), but the effect magnitude is
+    # normalized so no single campaign trivially dominates. Some campaigns hurt
+    # certain segments (negative uplift = annoyance / opt-out). This heterogeneity
+    # is exactly what a good personalized policy exploits.
+    UPLIFT_STD = 0.11
+    p = np.zeros((n, N_CAMPAIGNS))
+    p[:, 0] = p0
+    for k in range(1, N_CAMPAIGNS):
+        wk = rng.normal(0, 1.0, dz)
+        base_lift = rng.uniform(0.0, 0.03)              # small, similar across campaigns
+        uplift = base_lift + UPLIFT_STD * unit(Z @ wk)  # nonlinear shape, controlled size
+        # Discount campaigns work better on discount-affine customers.
+        if "off" in CAMPAIGN_NAMES[k] or "ship" in CAMPAIGN_NAMES[k]:
+            aff = df["discount_affinity"].to_numpy()
+            uplift += 0.06 * (aff - 0.4) + 0.05 * (aff > 0.6)
+        # Recency matters: lapsed customers respond more to reminders/retargeting,
+        # but only past a threshold (a step change, not a smooth ramp).
+        if "reminder" in CAMPAIGN_NAMES[k] or "ad" in CAMPAIGN_NAMES[k]:
+            rec = df["recency_days"].to_numpy()
+            uplift += 0.05 * (rec > 60) - 0.03 * (rec < 15)
+        p[:, k] = np.clip(p0 + uplift, 0.001, 0.98)
+
+    # Expected net profit of showing campaign k = margin * P(convert | k) - cost_k.
+    V = margin[:, None] * p - CAMPAIGN_COSTS[None, :]
+    return V, p, margin
+
+
+def _simulate_log(df, p, margin, rng):
+    """
+    Given true per-campaign conversion probabilities, simulate one randomized
+    experiment: assign each customer a campaign uniformly at random, then draw
+    their observed conversion and revenue. Returns a logged DataFrame with the
+    columns a real marketing team would have (NO ground-truth leakage).
+    """
+    n = len(df)
+    assigned = rng.integers(0, N_CAMPAIGNS, n)
+    p_assigned = p[np.arange(n), assigned]
+    converted = (rng.random(n) < p_assigned).astype(np.int64)
+    # Observed revenue: noisy realization of the per-conversion margin.
+    rev_noise = rng.normal(1.0, 0.15, n).clip(0.3, 2.0)
+    revenue = converted * margin * rev_noise
+
+    log = df.copy()
+    log["campaign"] = assigned
+    log["propensity"] = 1.0 / N_CAMPAIGNS   # known randomization probability
+    log["converted"] = converted
+    log["revenue"] = revenue
+    return log
+
+# ---------------------------------------------------------------------------
+# Generation entry point
+# ---------------------------------------------------------------------------
+
+def generate(force=False):
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+    if (not force and os.path.exists(TRAIN_PATH) and os.path.exists(VAL_USERS_PATH)
+            and os.path.exists(TRUTH_PATH)):
+        print(f"Data: already generated at {DATA_DIR} (use --force to regenerate)")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
+    print("Generating synthetic marketing-campaign experiment...")
     t0 = time.time()
+    rng = np.random.default_rng(RANDOM_SEED)
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    # Draw one big population, then split into a logged training experiment and a
+    # held-out set of customers used to score targeting policies.
+    df = _raw_customers(N_TRAIN + N_VAL, rng)
+    V, p, margin = _true_outcome_model(df, rng)
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    train_df = df.iloc[:N_TRAIN].reset_index(drop=True)
+    val_df = df.iloc[N_TRAIN:].reset_index(drop=True)
+    p_train, margin_train = p[:N_TRAIN], margin[:N_TRAIN]
+    V_val, p_val, margin_val = V[N_TRAIN:], p[N_TRAIN:], margin[N_TRAIN:]
+
+    # Training experiment (what the recommender learns from).
+    train_log = _simulate_log(train_df, p_train, margin_train, rng)
+    train_log.to_parquet(TRAIN_PATH, index=False)
+
+    # Held-out customers to be targeted (features only — the recommender picks a
+    # campaign for each of them). Also emit a randomized val log for optional
+    # off-policy sanity checks.
+    val_df.to_parquet(VAL_USERS_PATH, index=False)
+    val_log = _simulate_log(val_df, p_val, margin_val, rng)
+    val_log.to_parquet(VAL_LOG_PATH, index=False)
+
+    # Ground-truth value table + reference policy values, used ONLY by the
+    # evaluator in this file. Not part of the recommender's inputs.
+    oracle_action = V_val.argmax(axis=1)
+    oracle_value = V_val[np.arange(len(V_val)), oracle_action].mean()
+    per_campaign_mean = V_val.mean(axis=0)
+    best_single = int(per_campaign_mean.argmax())
+    np.savez_compressed(
+        TRUTH_PATH,
+        V_val=V_val,
+        oracle_value=oracle_value,
+        no_contact_value=per_campaign_mean[0],
+        best_single_value=per_campaign_mean[best_single],
+        best_single_campaign=best_single,
+        per_campaign_mean=per_campaign_mean,
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
     t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    print(f"Data: generated in {t1 - t0:.1f}s")
+    print(f"  train experiment : {len(train_log):,} logged customers -> {TRAIN_PATH}")
+    print(f"  val customers    : {len(val_df):,} held-out -> {VAL_USERS_PATH}")
+    print(f"  campaigns        : {N_CAMPAIGNS} ({', '.join(CAMPAIGN_NAMES)})")
+    print( "  reference policy values ($/customer):")
+    print(f"    no-contact (control) : {per_campaign_mean[0]:.4f}")
+    print(f"    best single campaign : {per_campaign_mean[best_single]:.4f} "
+          f"({CAMPAIGN_NAMES[best_single]})")
+    print(f"    oracle (personalized): {oracle_value:.4f}")
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Runtime utilities (imported by recommend.py)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def load_train_experiment():
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Load the logged randomized experiment the recommender learns from.
+
+    Returns a DataFrame with the raw feature columns plus:
+        campaign    : int  which variant this customer was shown (0..K-1)
+        propensity  : float probability that variant was assigned (== 1/K)
+        converted   : int  observed conversion (0/1)
+        revenue     : float observed revenue ($, 0 if no conversion)
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    if not os.path.exists(TRAIN_PATH):
+        print("No data found. Run `uv run prepare.py` first.", file=sys.stderr)
+        sys.exit(1)
+    return pd.read_parquet(TRAIN_PATH)
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+def load_val_customers():
+    """Load the held-out customers to be targeted (raw features only)."""
+    if not os.path.exists(VAL_USERS_PATH):
+        print("No data found. Run `uv run prepare.py` first.", file=sys.stderr)
+        sys.exit(1)
+    return pd.read_parquet(VAL_USERS_PATH)
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
 
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+def load_val_log():
+    """Load the randomized val log (for optional off-policy sanity checks)."""
+    return pd.read_parquet(VAL_LOG_PATH)
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_policy(recommender):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Score a targeting policy against the frozen ground truth.
+
+    The `recommender` must expose `.recommend(df) -> array[int]`, returning one
+    campaign index (0..K-1) per held-out customer. Because we hold the true
+    per-customer expected net value of every campaign, the policy value is exact
+    and perfectly comparable across experiments (no evaluation noise).
+
+    The headline metric is POLICY_VALUE: expected net profit ($) per targeted
+    customer under the recommended assignments. HIGHER IS BETTER.
+
+    Returns a dict of metrics; `policy_value` is the one to optimize.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    truth = np.load(TRUTH_PATH)
+    V_val = truth["V_val"]                    # (n_val, K) true expected net value
+    n = V_val.shape[0]
+
+    val_customers = load_val_customers()
+    actions = np.asarray(recommender.recommend(val_customers)).astype(int)
+    assert actions.shape == (n,), f"recommend() must return {n} actions, got {actions.shape}"
+    assert actions.min() >= 0 and actions.max() < N_CAMPAIGNS, "action out of range"
+
+    policy_value = float(V_val[np.arange(n), actions].mean())
+    oracle_value = float(truth["oracle_value"])
+    no_contact_value = float(truth["no_contact_value"])
+    best_single_value = float(truth["best_single_value"])
+
+    regret = oracle_value - policy_value
+    # Fraction of the achievable personalization gain that was captured.
+    denom = oracle_value - best_single_value
+    gain_captured = (policy_value - best_single_value) / denom if denom > 1e-9 else 0.0
+    lift_vs_best_single = (policy_value / best_single_value - 1.0) * 100 if best_single_value != 0 else 0.0
+
+    # Distribution of recommended actions (useful diagnostic).
+    action_counts = np.bincount(actions, minlength=N_CAMPAIGNS)
+
+    return {
+        "policy_value": policy_value,           # <- optimize this (higher better)
+        "regret": regret,                       # oracle - policy (lower better)
+        "oracle_value": oracle_value,
+        "no_contact_value": no_contact_value,
+        "best_single_value": best_single_value,
+        "lift_vs_best_single_pct": lift_vs_best_single,
+        "gain_captured_frac": gain_captured,
+        "action_counts": action_counts.tolist(),
+    }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare data for autoresearch")
+    parser.add_argument("--force", action="store_true", help="Regenerate even if cache exists")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    print(f"Cache directory: {CACHE_DIR}\n")
+    generate(force=args.force)
+    print("\nDone! Ready to run experiments with `uv run recommend.py`.")
