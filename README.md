@@ -18,15 +18,20 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
 
-## Rust port (GGUF LLM inference)
+## Ports (GGUF LLM inference)
 
-A Rust port lives under [`rust/`](rust/). Rather than training from scratch, it
-focuses on **loading GGUF-format LLMs and generating text** — built on
-[`candle`](https://github.com/huggingface/candle), running on CPU by default
-(CUDA/Metal via feature flags). It can inspect any GGUF file (`info`) and run
-generation for the `llama`, `qwen2`, `qwen3`, `phi3` and `gemma3` architectures.
-See [`rust/README.md`](rust/README.md) for details. The Python training code
-below is unchanged.
+Two ports focus on **loading GGUF-format LLMs and generating text** (rather than
+training from scratch). The Python training code below is unchanged.
+
+- **Rust** — [`rust/`](rust/): built on
+  [`candle`](https://github.com/huggingface/candle), runs on CPU by default
+  (CUDA/Metal via feature flags). Inspects any GGUF (`info`) and generates for
+  the `llama`, `qwen2`, `qwen3`, `phi3` and `gemma3` architectures. See
+  [`rust/README.md`](rust/README.md).
+- **Erlang** — [`erlang/`](erlang/): a dependency-free, pure-Erlang
+  implementation (GGUF parser, dequantization, tensor math, Llama forward pass,
+  BPE tokenizer). Great for understanding the algorithms; not built for large
+  models. See [`erlang/README.md`](erlang/README.md).
 
 ## Quick start
 

@@ -1,0 +1,8 @@
+#!/usr/bin/env escript
+%%! -noshell
+%%% Thin escript wrapper: put the compiled beams on the path and dispatch to
+%%% ar_cli. Run `make` first so that ebin/ contains the compiled modules.
+main(Args) ->
+    Dir = filename:dirname(escript:script_name()),
+    true = code:add_pathz(filename:join(Dir, "ebin")),
+    ar_cli:run(Args).
