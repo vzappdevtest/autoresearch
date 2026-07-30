@@ -18,6 +18,16 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
 
+## Rust port (GGUF LLM inference)
+
+A Rust port lives under [`rust/`](rust/). Rather than training from scratch, it
+focuses on **loading GGUF-format LLMs and generating text** — built on
+[`candle`](https://github.com/huggingface/candle), running on CPU by default
+(CUDA/Metal via feature flags). It can inspect any GGUF file (`info`) and run
+generation for the `llama`, `qwen2`, `qwen3`, `phi3` and `gemma3` architectures.
+See [`rust/README.md`](rust/README.md) for details. The Python training code
+below is unchanged.
+
 ## Quick start
 
 **Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
